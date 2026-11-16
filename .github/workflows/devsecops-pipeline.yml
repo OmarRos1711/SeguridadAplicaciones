@@ -1,0 +1,96 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  sast-semgrep:
+    name: "SAST - Semgrep Code Scanning"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código fuente
+        uses: actions/checkout@v4
+
+      - name: Ejecutar análisis SAST con Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/owasp-top-ten
+          generateSarif: "semgrep-results.sarif"
+
+      - name: Subir artefacto SARIF de Semgrep
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-sarif-report
+          path: semgrep-results.sarif
+
+      - name: Quality Gate SAST (Fallar ante severidad ERROR / HIGH)
+        if: always()
+        run: |
+          python3 - << 'EOF'
+          import json, sys, os
+          path = "semgrep-results.sarif"
+          if not os.path.exists(path):
+              print("No se generó el archivo semgrep-results.sarif")
+              sys.exit(1)
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          high_findings = []
+          for run in data.get("runs", []):
+              for res in run.get("results", []):
+                  if res.get("level", "").lower() == "error":
+                      high_findings.append(res.get("ruleId", "unknown-rule"))
+          print(f"Hallazgos Semgrep con nivel ERROR/HIGH: {len(high_findings)}")
+          if high_findings:
+              print("Reglas activadas:", ", ".join(sorted(set(high_findings))[:10]))
+              sys.exit(1)
+          EOF
+
+  sca-and-sbom:
+    name: "SCA & Generación de SBOM (CycloneDX)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código fuente
+        uses: actions/checkout@v4
+
+      # 1. Generación del SBOM en estándar OWASP CycloneDX (ECMA-424)
+      - name: Generar SBOM con Syft (CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: "sbom.cyclonedx.json"
+
+      - name: Subir artefacto SBOM (CycloneDX)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
+
+      # 2. Análisis SCA y Quality Gate con OWASP Dependency-Check (CVSS >= 7.0)
+      - name: OWASP Dependency-Check Scan (Quality Gate CVSS >= 7.0)
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'NodeGoat-AppSegura'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+          args: >
+            --failOnCVSS 7
+            --enableExperimental
+
+      - name: Subir reporte SCA de Dependency-Check
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: reports/
